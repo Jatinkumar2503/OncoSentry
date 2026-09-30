@@ -1,0 +1,465 @@
+"""Segmentation metrics with honest definitions.
+
+Two things were wrong with the metrics this project reported before.
+
+*Smoothing.* Dice was computed as ``(2i + 1) / (s + 1)``. That +1 is a training
+loss stabiliser; in a reported result it inflates good scores and, worse, awards
+1.0 to an empty prediction on an empty image. Reported metrics here are exact,
+with the empty/empty case handled explicitly and stated.
+
+*"Average precision".* The previous ``instance_ap_50_95`` had no confidence
+ranking and no precision-recall curve, so it was not average precision. It is
+kept under an accurate name — the matching score TP/(TP+FP+FN) averaged over IoU
+thresholds 0.50:0.05:0.95, the metric popularised by the 2018 Data Science Bowl
+— and real COCO AP is available separately for predictors that emit scores.
+
+Instance matching also used to compare every predicted mask against every true
+mask over the whole image, which is O(P x T x H x W). Here the intersection
+matrix is built in a single pass over the label images with ``np.bincount``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+IOU_THRESHOLDS: tuple[float, ...] = tuple(round(0.50 + 0.05 * step, 2) for step in range(10))
+
+
+def confusion(
+    prediction: np.ndarray, truth: np.ndarray, valid: np.ndarray | None = None
+) -> dict[str, int]:
+    """Pixel counts restricted to *valid* (letterbox padding is never counted)."""
+    predicted = np.asarray(prediction).astype(bool)
+    actual = np.asarray(truth).astype(bool)
+    if predicted.shape != actual.shape:
+        raise ValueError(f"Shape mismatch: prediction {predicted.shape} vs truth {actual.shape}.")
+    if valid is not None:
+        keep = np.asarray(valid).astype(bool)
+        if keep.shape != predicted.shape:
+            raise ValueError("Valid mask shape does not match the prediction.")
+        predicted = predicted & keep
+        actual = actual & keep
+    true_positive = int(np.count_nonzero(predicted & actual))
+    return {
+        "tp": true_positive,
+        "fp": int(np.count_nonzero(predicted)) - true_positive,
+        "fn": int(np.count_nonzero(actual)) - true_positive,
+    }
+
+
+def dice_from_counts(counts: dict[str, int]) -> float:
+    denominator = 2 * counts["tp"] + counts["fp"] + counts["fn"]
+    # Both masks empty: the prediction is exactly right, so Dice is defined as 1.
+    return 1.0 if denominator == 0 else 2 * counts["tp"] / denominator
+
+
+def iou_from_counts(counts: dict[str, int]) -> float:
+    denominator = counts["tp"] + counts["fp"] + counts["fn"]
+    return 1.0 if denominator == 0 else counts["tp"] / denominator
+
+
+def semantic_metrics(
+    prediction: np.ndarray, truth: np.ndarray, valid: np.ndarray | None = None
+) -> dict[str, float]:
+    """Exact, unsmoothed Dice and IoU for one image."""
+    counts = confusion(prediction, truth, valid)
+    return {"dice": dice_from_counts(counts), "iou": iou_from_counts(counts), **counts}
+
+
+def intersection_matrix(
+    predicted_labels: np.ndarray, true_labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (intersections, predicted areas, true areas) for two label images.
+
+    Labels are 1..n with 0 as background. Complexity is O(H x W) rather than
+    O(instances^2 x H x W).
+    """
+    predicted = np.asarray(predicted_labels, dtype=np.int64)
+    truth = np.asarray(true_labels, dtype=np.int64)
+    if predicted.shape != truth.shape:
+        raise ValueError("Label images must have the same shape.")
+    n_pred = int(predicted.max())
+    n_true = int(truth.max())
+    flat = (predicted.ravel() * (n_true + 1)) + truth.ravel()
+    table = np.bincount(flat, minlength=(n_pred + 1) * (n_true + 1)).reshape(n_pred + 1, n_true + 1)
+    intersections = table[1:, 1:].astype(np.int64)
+    predicted_areas = table[1:, :].sum(axis=1).astype(np.int64)
+    true_areas = table[:, 1:].sum(axis=0).astype(np.int64)
+    return intersections, predicted_areas, true_areas
+
+
+def instance_iou_matrix(predicted_labels: np.ndarray, true_labels: np.ndarray) -> np.ndarray:
+    intersections, predicted_areas, true_areas = intersection_matrix(predicted_labels, true_labels)
+    if intersections.size == 0:
+        return intersections.astype(np.float64)
+    unions = predicted_areas[:, None] + true_areas[None, :] - intersections
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ious = np.where(unions > 0, intersections / np.maximum(unions, 1), 0.0)
+    return ious.astype(np.float64)
+
+
+def matching_score(
+    predicted_labels: np.ndarray,
+    true_labels: np.ndarray,
+    thresholds: tuple[float, ...] = IOU_THRESHOLDS,
+) -> dict[str, float]:
+    """Mean of TP/(TP+FP+FN) over IoU thresholds — the DSB2018 matching metric.
+
+    This is *not* average precision: the classical baseline assigns no confidence
+    to a component, so there is nothing to rank and no precision-recall curve to
+    integrate. Reporting it as AP would overstate what was measured.
+    """
+    n_pred = int(np.asarray(predicted_labels).max())
+    n_true = int(np.asarray(true_labels).max())
+    if n_pred == 0 and n_true == 0:
+        return {"mean": 1.0, **{f"at_{threshold:.2f}": 1.0 for threshold in thresholds}}
+    if n_pred == 0 or n_true == 0:
+        return {"mean": 0.0, **{f"at_{threshold:.2f}": 0.0 for threshold in thresholds}}
+    ious = instance_iou_matrix(predicted_labels, true_labels)
+    per_threshold: dict[str, float] = {}
+    scores: list[float] = []
+    for threshold in thresholds:
+        matched = _greedy_match(ious, threshold)
+        true_positive = len(matched)
+        denominator = true_positive + (n_pred - true_positive) + (n_true - true_positive)
+        value = true_positive / denominator if denominator else 1.0
+        per_threshold[f"at_{threshold:.2f}"] = float(value)
+        scores.append(value)
+    return {"mean": float(np.mean(scores)), **per_threshold}
+
+
+def _greedy_match(ious: np.ndarray, threshold: float) -> list[tuple[int, int]]:
+    """Match instances greedily by descending IoU, one-to-one, above *threshold*."""
+    candidates = np.argwhere(ious >= threshold)
+    if candidates.size == 0:
+        return []
+    order = np.argsort(-ious[candidates[:, 0], candidates[:, 1]], kind="stable")
+    used_predictions: set[int] = set()
+    used_truths: set[int] = set()
+    matches: list[tuple[int, int]] = []
+    for index in order:
+        row, column = int(candidates[index, 0]), int(candidates[index, 1])
+        if row in used_predictions or column in used_truths:
+            continue
+        used_predictions.add(row)
+        used_truths.add(column)
+        matches.append((row, column))
+    return matches
+
+
+def instance_counts(
+    predicted_labels: np.ndarray, true_labels: np.ndarray, threshold: float = 0.5
+) -> dict[str, int]:
+    n_pred = int(np.asarray(predicted_labels).max())
+    n_true = int(np.asarray(true_labels).max())
+    if n_pred == 0 or n_true == 0:
+        return {"tp": 0, "fp": n_pred, "fn": n_true, "predicted": n_pred, "true": n_true}
+    matches = _greedy_match(instance_iou_matrix(predicted_labels, true_labels), threshold)
+    true_positive = len(matches)
+    return {
+        "tp": true_positive,
+        "fp": n_pred - true_positive,
+        "fn": n_true - true_positive,
+        "predicted": n_pred,
+        "true": n_true,
+    }
+
+
+def average_precision(
+    scored_instances: list[tuple[float, np.ndarray]],
+    true_labels: np.ndarray,
+    thresholds: tuple[float, ...] = IOU_THRESHOLDS,
+) -> dict[str, float]:
+    """Real COCO-style AP: rank by confidence, integrate the precision-recall curve.
+
+    ``scored_instances`` are ``(confidence, boolean mask)`` pairs. Use this only
+    for predictors that genuinely produce a confidence per instance.
+    """
+    n_true = int(np.asarray(true_labels).max())
+    if not scored_instances and n_true == 0:
+        return {"mean": 1.0, **{f"at_{t:.2f}": 1.0 for t in thresholds}}
+    if not scored_instances or n_true == 0:
+        return {"mean": 0.0, **{f"at_{t:.2f}": 0.0 for t in thresholds}}
+
+    ordered = sorted(scored_instances, key=lambda item: -item[0])
+    predicted_labels = np.zeros_like(np.asarray(true_labels), dtype=np.int64)
+    for index, (_, mask) in enumerate(ordered, start=1):
+        predicted_labels[np.asarray(mask).astype(bool)] = index
+    ious = instance_iou_matrix(predicted_labels, true_labels)
+
+    results: dict[str, float] = {}
+    values: list[float] = []
+    for threshold in thresholds:
+        matched_truths: set[int] = set()
+        hits = np.zeros(len(ordered), dtype=np.float64)
+        for row in range(len(ordered)):
+            best_column, best_iou = -1, threshold
+            for column in range(n_true):
+                if column in matched_truths or ious[row, column] < best_iou:
+                    continue
+                best_column, best_iou = column, ious[row, column]
+            if best_column >= 0:
+                matched_truths.add(best_column)
+                hits[row] = 1.0
+        cumulative_tp = np.cumsum(hits)
+        cumulative_fp = np.cumsum(1.0 - hits)
+        recalls = cumulative_tp / n_true
+        precisions = cumulative_tp / np.maximum(cumulative_tp + cumulative_fp, 1e-12)
+        # 101-point interpolated precision, as in the COCO evaluator. Recall levels
+        # the predictions never reach contribute zero.
+        precisions = np.maximum.accumulate(precisions[::-1])[::-1]
+        grid = np.linspace(0.0, 1.0, 101)
+        indices = np.searchsorted(recalls, grid, side="left")
+        sampled = np.zeros_like(grid)
+        reachable = indices < len(precisions)
+        sampled[reachable] = precisions[indices[reachable]]
+        value = float(sampled.mean())
+        results[f"at_{threshold:.2f}"] = value
+        values.append(value)
+    return {"mean": float(np.mean(values)), **results}
+
+
+def aggregate(per_image: list[dict[str, Any]]) -> dict[str, float]:
+    """Combine per-image results without letting a short final batch dominate.
+
+    Both views are reported because they answer different questions: ``macro`` is
+    the mean over images, ``micro`` pools pixels across the whole split.
+    """
+    if not per_image:
+        return {"images": 0}
+    totals = {"tp": 0, "fp": 0, "fn": 0}
+    for row in per_image:
+        for key in totals:
+            totals[key] += int(row.get(key, 0))
+    return {
+        "images": len(per_image),
+        "macro_dice": float(np.mean([float(row["dice"]) for row in per_image])),
+        "macro_iou": float(np.mean([float(row["iou"]) for row in per_image])),
+        "micro_dice": dice_from_counts(totals),
+        "micro_iou": iou_from_counts(totals),
+        **{f"total_{key}": value for key, value in totals.items()},
+    }
+
+
+def bootstrap_interval(
+    values: list[float],
+    *,
+    groups: list[str] | None = None,
+    resamples: int = 2000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Confidence interval for a mean, resampling whole clusters.
+
+    Resampling images independently would overstate precision for the same reason
+    a per-image sign test overstates significance: LIVECell tiles one capture into
+    several crops and a manifest is a time-lapse of one well, so images are
+    correlated. Passing *groups* resamples acquisition groups instead, which is
+    the unit that is actually exchangeable.
+
+    The interval still says nothing about a second plate, a second cell line, or a
+    second seed. It is uncertainty from the sample of images, and no more.
+    """
+    array = np.asarray([v for v in values if np.isfinite(v)], dtype=float)
+    if array.size == 0:
+        return {"evaluated": False, "reason": "No finite values."}
+    if array.size < 3:
+        return {"evaluated": False, "reason": "Fewer than three observations."}
+
+    rng = np.random.default_rng(seed)
+    if groups is None:
+        draws = [
+            float(rng.choice(array, size=array.size, replace=True).mean()) for _ in range(resamples)
+        ]
+        unit = "image"
+        clusters = array.size
+    else:
+        buckets: dict[str, list[float]] = {}
+        for value, group in zip(values, groups, strict=True):
+            if np.isfinite(value):
+                buckets.setdefault(str(group), []).append(float(value))
+        keys = list(buckets)
+        clusters = len(keys)
+        if clusters < 3:
+            return {"evaluated": False, "reason": "Fewer than three clusters."}
+        draws = []
+        for _ in range(resamples):
+            chosen = rng.integers(0, clusters, clusters)
+            pooled = [v for index in chosen for v in buckets[keys[index]]]
+            draws.append(float(np.mean(pooled)))
+        unit = "acquisition group"
+
+    tail = (1.0 - confidence) / 2.0
+    return {
+        "evaluated": True,
+        "mean": float(array.mean()),
+        "ci_low": float(np.percentile(draws, 100 * tail)),
+        "ci_high": float(np.percentile(draws, 100 * (1 - tail))),
+        "confidence": confidence,
+        "resamples": resamples,
+        "resampling_unit": unit,
+        "clusters": clusters,
+    }
+
+
+def paired_bootstrap(
+    first: list[float],
+    second: list[float],
+    *,
+    groups: list[str] | None = None,
+    resamples: int = 2000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Interval for the *difference* between two methods scored on the same images.
+
+    Paired rather than independent, because the two methods saw identical images:
+    an unpaired comparison throws away the pairing and widens the interval for no
+    reason. The question answered is whether the interval for the difference
+    excludes zero.
+    """
+    differences = [
+        a - b for a, b in zip(first, second, strict=True) if np.isfinite(a) and np.isfinite(b)
+    ]
+    keep = (
+        [
+            g
+            for g, a, b in zip(groups, first, second, strict=True)
+            if np.isfinite(a) and np.isfinite(b)
+        ]
+        if groups is not None
+        else None
+    )
+    interval = bootstrap_interval(differences, groups=keep, resamples=resamples, seed=seed)
+    if not interval.get("evaluated"):
+        return interval
+    interval["difference"] = interval.pop("mean")
+    interval["excludes_zero"] = bool(interval["ci_low"] > 0.0 or interval["ci_high"] < 0.0)
+    return interval
+
+
+def replicate_interval(
+    per_seed: dict[str, list[float]],
+    *,
+    groups: list[str] | None = None,
+    resamples: int = 2000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Uncertainty from *both* the images tested and the seed trained from.
+
+    A bootstrap over images answers "what if I had tested on different images?".
+    It is silent on "what if I had trained from a different initialisation?", and
+    those are separate questions with separate answers. Reporting only the first
+    understates the uncertainty of any claim about a training recipe, which is
+    exactly how a difference smaller than the seed spread gets called significant.
+
+    ``per_seed`` maps a seed label to that run's per-image scores, all scored on
+    the same images in the same order. Both levels are resampled together: seeds
+    with replacement, and image clusters with replacement.
+    """
+    labels = sorted(per_seed)
+    if len(labels) < 2:
+        return {"evaluated": False, "reason": "Fewer than two seeds."}
+    lengths = {len(per_seed[label]) for label in labels}
+    if len(lengths) != 1:
+        raise ValueError("Every seed must be scored on the same images.")
+    count = lengths.pop()
+    if count == 0:
+        return {"evaluated": False, "reason": "No images."}
+
+    seed_means = np.array([float(np.mean(per_seed[label])) for label in labels])
+    rng = np.random.default_rng(seed)
+
+    if groups is None:
+        index_by_group = {"all": list(range(count))}
+    else:
+        if len(groups) != count:
+            raise ValueError("groups must be one label per image.")
+        index_by_group = {}
+        for position, group in enumerate(groups):
+            index_by_group.setdefault(str(group), []).append(position)
+    keys = list(index_by_group)
+
+    draws = []
+    for _ in range(resamples):
+        picked_seeds = rng.integers(0, len(labels), len(labels))
+        picked_groups = rng.integers(0, len(keys), len(keys))
+        positions = [i for g in picked_groups for i in index_by_group[keys[g]]]
+        draws.append(
+            float(np.mean([per_seed[labels[s]][i] for s in picked_seeds for i in positions]))
+        )
+    tail = (1.0 - confidence) / 2.0
+    return {
+        "evaluated": True,
+        "seeds": len(labels),
+        "images": count,
+        "mean": float(seed_means.mean()),
+        "seed_values": {label: float(np.mean(per_seed[label])) for label in labels},
+        "seed_sd": float(seed_means.std(ddof=1)),
+        "ci_low": float(np.percentile(draws, 100 * tail)),
+        "ci_high": float(np.percentile(draws, 100 * (1 - tail))),
+        "confidence": confidence,
+        "accounts_for": ["image sampling", "training seed"],
+    }
+
+
+def replicate_difference(
+    first: dict[str, list[float]],
+    second: dict[str, list[float]],
+    *,
+    groups: list[str] | None = None,
+    resamples: int = 2000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Difference between two conditions, resampling seeds and images together.
+
+    Seeds are not paired across conditions - run *k* of one condition has no
+    special relationship to run *k* of the other - so seeds are drawn
+    independently for each side while the images stay shared.
+    """
+    if len(first) < 2 or len(second) < 2:
+        return {"evaluated": False, "reason": "Each condition needs at least two seeds."}
+    left, right = sorted(first), sorted(second)
+    count = len(first[left[0]])
+    if groups is not None and len(groups) != count:
+        raise ValueError("groups must be one label per image.")
+
+    index_by_group: dict[str, list[int]] = {}
+    for position in range(count):
+        key = str(groups[position]) if groups is not None else "all"
+        index_by_group.setdefault(key, []).append(position)
+    keys = list(index_by_group)
+
+    rng = np.random.default_rng(seed)
+    draws = []
+    for _ in range(resamples):
+        picked_groups = rng.integers(0, len(keys), len(keys))
+        positions = [i for g in picked_groups for i in index_by_group[keys[g]]]
+        a = np.mean(
+            [first[left[s]][i] for s in rng.integers(0, len(left), len(left)) for i in positions]
+        )
+        b = np.mean(
+            [
+                second[right[s]][i]
+                for s in rng.integers(0, len(right), len(right))
+                for i in positions
+            ]
+        )
+        draws.append(float(a - b))
+    observed = float(
+        np.mean([np.mean(first[label]) for label in left])
+        - np.mean([np.mean(second[label]) for label in right])
+    )
+    return {
+        "evaluated": True,
+        "difference": observed,
+        "ci_low": float(np.percentile(draws, 2.5)),
+        "ci_high": float(np.percentile(draws, 97.5)),
+        "excludes_zero": bool(
+            float(np.percentile(draws, 2.5)) > 0 or float(np.percentile(draws, 97.5)) < 0
+        ),
+        "seeds": {"first": len(left), "second": len(right)},
+        "accounts_for": ["image sampling", "training seed"],
+    }
