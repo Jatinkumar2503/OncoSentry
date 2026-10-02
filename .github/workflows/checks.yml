@@ -1,0 +1,119 @@
+# Every check the project already enforces locally, run where nobody can skip it.
+#
+# The audit that prompted this found four defects that passed the whole local
+# suite, so the point is not that CI would have caught them -- it would not --
+# but that the checks which *can* catch a regression should never depend on
+# somebody remembering to run them.
+name: checks
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A second push to the same branch makes the first run's answer irrelevant.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the pinned environment
+        # --locked fails rather than silently resolving something new, so a stale
+        # lock file is a build error instead of an untested dependency set.
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Types
+        run: uv run mypy
+
+      - name: Tests
+        # No accelerator on a runner, so the device-matrix tests fall back to CPU
+        # and the multiprocessing test is the long pole at roughly 35 seconds.
+        run: >-
+          uv run pytest -q --cov=tribovision --cov=triboguard --cov-branch
+          --cov-report=term-missing --cov-fail-under=90
+
+      - name: The lock file matches pyproject
+        run: uv lock --check
+
+  artifacts:
+    # The generated documents are evidence, so a drift between them and the
+    # artifacts they are built from is a defect rather than a formatting nit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+
+      - name: RESULTS.md is regenerated, not hand-edited
+        # runs/ is git-ignored, so the runner rebuilds it from the published
+        # copies first: the table must regenerate from exactly the evidence
+        # committed beside it.
+        run: |
+          uv run python scripts/collect_results.py runs --unpublish results > /tmp/RESULTS.md
+          diff -u docs/RESULTS.md /tmp/RESULTS.md
+
+      - name: The experiment plan is regenerated, not hand-edited
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          from tribovision.treatment import plan_experiment
+          plan_experiment(Path("/tmp/planned_experiment.csv"))
+          PY
+          diff -u docs/planned_experiment.csv /tmp/planned_experiment.csv
+
+      - name: The browser's tables still match the Python that generated them
+        # The site reimplements TriboGuard's arithmetic to run without a server.
+        # If these drift, both halves keep working and quietly disagree.
+        # Compared as numbers within a relative 1e-12, not as text: scipy on a
+        # Linux runner differs from macOS in about the 15th significant digit,
+        # which is noise between machines rather than drift.
+        run: |
+          uv run python scripts/generate_chi2_table.py --check
+          uv run python scripts/generate_parity_fixtures.py --check
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The site now lives in this repository, so it is checked on every run like
+    # anything else. The guard stays only so a checkout without it -- a sparse
+    # clone, say -- skips rather than fails.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npx tsc --noEmit
+        working-directory: web
+      - name: Parity with the Python package
+        run: npm test
+        working-directory: web
