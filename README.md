@@ -243,6 +243,8 @@ mypy
 
 ## Roadmap & Milestone Progression
 
+For the detailed multi-phase technical specification, see [docs/ROADMAP.md](docs/ROADMAP.md).
+
 - [x] **Milestone 1**: Fork & catalog complete baseline benchmark suite (TriboGuard/TriboVision).
 - [x] **Milestone 2**: Pre-registered damage blindness benchmark replication across 4 cell lines.
 - [ ] **Milestone 3**: Foundation model (MicroSAM / Multi-task Flow) instance segmentation integration.
